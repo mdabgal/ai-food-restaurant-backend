@@ -4,6 +4,7 @@ const { Router } = require('express');
 const {
   getUsers,
   updateUserRole,
+  updateUserProfile,
   getUserById,
   deleteUser,
 } = require('../controllers/userController');
@@ -18,5 +19,6 @@ router.delete('/:id', verifyToken, verifyRole('admin'), deleteUser);
 
 // ─── Admin or Self Routes ──────────────────────────────────────────────────────
 router.get('/:id', verifyToken, getUserById);
+router.patch('/:id', verifyToken, updateUserProfile);
 
 module.exports = router;

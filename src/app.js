@@ -10,6 +10,7 @@ const foodRoutes = require('./routes/foodRoutes');
 const itemRoutes = require('./routes/itemRoutes');
 const userRoutes = require('./routes/userRoutes');
 const analyticsRoutes = require('./routes/analyticsRoutes');
+const aiRoutes = require('./routes/aiRoutes');
 
 const app = express();
 
@@ -43,6 +44,7 @@ app.use('/api/foods', foodRoutes);
 app.use('/api/items', itemRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/analytics', analyticsRoutes);
+app.use('/api/ai', aiRoutes);
 
 // ─── 404 Handler ───────────────────────────────────────────────────────────────
 app.use((req, res) => {

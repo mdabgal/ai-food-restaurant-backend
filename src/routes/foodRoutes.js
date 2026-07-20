@@ -14,6 +14,7 @@ const col       = () => getDB().collection(COLLECTION);
 const sendError = (res, status, message) =>
   res.status(status).json({ success: false, message });
 const isValidId = (id) => ObjectId.isValid(id) && String(new ObjectId(id)) === id;
+const escapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 // ─── GET /api/foods ───────────────────────────────────────────────────────────
 // Query params:
@@ -25,24 +26,23 @@ const isValidId = (id) => ObjectId.isValid(id) && String(new ObjectId(id)) === i
 //   ?limit=       items per page (default 10)
 router.get('/', async (req, res) => {
   try {
-    const { category, search, sort, minRating } = req.query;
+    const { category, search, sort, minRating, minPrice, maxPrice } = req.query;
 
     // ── Parse & validate pagination params ──────────────────────────────────
-    const page  = Math.max(1, parseInt(req.query.page,  10) || 1);
+    const requestedPage = Math.max(1, parseInt(req.query.page, 10) || 1);
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 10));
-    const skip  = (page - 1) * limit;
 
     // ── Build filter ──────────────────────────────────────────────────────
     const filter = {};
 
     if (category) {
-      filter.category = { $regex: new RegExp(`^${category}$`, 'i') };
+      filter.category = { $regex: new RegExp(`^${escapeRegex(category)}$`, 'i') };
     }
 
     if (search) {
       filter.$or = [
-        { name:        { $regex: new RegExp(search, 'i') } },
-        { description: { $regex: new RegExp(search, 'i') } },
+        { name:        { $regex: new RegExp(escapeRegex(search), 'i') } },
+        { description: { $regex: new RegExp(escapeRegex(search), 'i') } },
       ];
     }
 
@@ -53,23 +53,41 @@ router.get('/', async (req, res) => {
       }
     }
 
+    const parsedMinPrice = Number(minPrice);
+    const parsedMaxPrice = Number(maxPrice);
+    if ((minPrice !== undefined && Number.isFinite(parsedMinPrice)) ||
+        (maxPrice !== undefined && Number.isFinite(parsedMaxPrice))) {
+      filter.price = {};
+      if (minPrice !== undefined && Number.isFinite(parsedMinPrice)) filter.price.$gte = parsedMinPrice;
+      if (maxPrice !== undefined && Number.isFinite(parsedMaxPrice)) filter.price.$lte = parsedMaxPrice;
+    }
+
     // ── Sort option ───────────────────────────────────────────────────────
-    let sortOption = { createdAt: -1 };
-    if (sort === 'price_asc')  sortOption = { price:  1 };
-    if (sort === 'price_desc') sortOption = { price: -1 };
+    let sortOption = { createdAt: -1, _id: -1 };
+    if (sort === 'price_asc')  sortOption = { price: 1, _id: 1 };
+    if (sort === 'price_desc') sortOption = { price: -1, _id: -1 };
+    if (sort === 'rating_desc') sortOption = { rating: -1, _id: -1 };
 
     // ── Execute query with pagination ─────────────────────────────────────
-    const [foods, total] = await Promise.all([
-      col().find(filter).sort(sortOption).skip(skip).limit(limit).toArray(),
-      col().countDocuments(filter),
-    ]);
+    const total = await col().countDocuments(filter);
+    const totalPages = Math.ceil(total / limit);
+    const currentPage = Math.min(requestedPage, Math.max(1, totalPages));
+    const skip = (currentPage - 1) * limit;
+    const foods = await col().find(filter).sort(sortOption).skip(skip).limit(limit).toArray();
 
     res.status(200).json({
       success:    true,
       count:      foods.length,
       total,
-      page,
-      totalPages: Math.ceil(total / limit),
+      currentPage,
+      limit,
+      totalPages,
+      pagination: {
+        total,
+        currentPage,
+        limit,
+        totalPages,
+      },
       data:       foods,
     });
   } catch (error) {

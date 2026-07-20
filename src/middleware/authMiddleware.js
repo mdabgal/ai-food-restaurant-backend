@@ -2,6 +2,8 @@
 
 const { verifyToken } = require('../utils/jwt.utils');
 const { sendError }   = require('../utils/response.utils');
+const { ObjectId } = require('mongodb');
+const { getDB } = require('../config/db');
 
 // ─── verifyToken Middleware ───────────────────────────────────────────────────
 /**
@@ -17,7 +19,7 @@ const { sendError }   = require('../utils/response.utils');
  * Usage:
  *   router.get('/protected', verifyToken, handler)
  */
-const verifyTokenMiddleware = (req, res, next) => {
+const verifyTokenMiddleware = async (req, res, next) => {
   // Read JWT from HttpOnly Cookie
   const token = req.cookies?.token;
 
@@ -27,7 +29,17 @@ const verifyTokenMiddleware = (req, res, next) => {
 
   try {
     const decoded = verifyToken(token);
-    req.user = decoded; // { id, email, role, iat, exp }
+    if (!ObjectId.isValid(decoded.id)) {
+      return sendError(res, 401, 'Invalid token. Authentication failed.');
+    }
+
+    const user = await getDB().collection('users').findOne(
+      { _id: new ObjectId(decoded.id) },
+      { projection: { email: 1, role: 1 } }
+    );
+    if (!user) return sendError(res, 401, 'Account no longer exists.');
+
+    req.user = { ...decoded, email: user.email, role: user.role };
     next();
   } catch (err) {
     const message =

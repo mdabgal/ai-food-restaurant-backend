@@ -25,6 +25,12 @@ const connectDB = async () => {
     // Select the database
     db = client.db('food_restaurant');
 
+    // Prevent duplicate identities during concurrent Google sign-ins.
+    await db.collection('users').createIndex(
+      { googleId: 1 },
+      { unique: true, sparse: true, name: 'unique_google_id' }
+    );
+
     console.log(`✅ MongoDB connected successfully → Database: "${db.databaseName}"`);
 
     // Handle unexpected disconnections

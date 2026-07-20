@@ -87,6 +87,40 @@ const updateUserRole = async (req, res) => {
   }
 };
 
+// PATCH /api/users/:id (Admin or self)
+const updateUserProfile = async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!isValidObjectId(id)) return sendError(res, 400, 'Invalid user ID.');
+
+    const isSelf = String(req.user.id) === id;
+    const isAdmin = req.user.role === 'admin';
+    if (!isSelf && !isAdmin) return sendError(res, 403, 'Access denied');
+
+    const update = {};
+    if (req.body.name !== undefined) {
+      if (typeof req.body.name !== 'string' || !req.body.name.trim()) return sendError(res, 422, 'Name must be a non-empty string.');
+      update.name = req.body.name.trim();
+    }
+    if (req.body.image !== undefined) {
+      if (req.body.image !== null && typeof req.body.image !== 'string') return sendError(res, 422, 'Image must be a URL string.');
+      update.image = req.body.image?.trim() || null;
+    }
+    if (!Object.keys(update).length) return sendError(res, 400, 'No valid profile fields provided.');
+
+    const user = await getUsersCol().findOneAndUpdate(
+      { _id: new ObjectId(id) },
+      { $set: { ...update, updatedAt: new Date() } },
+      { returnDocument: 'after', projection: { password: 0 } }
+    );
+    if (!user) return sendError(res, 404, 'User not found.');
+    return res.status(200).json({ success: true, message: 'Profile updated successfully', data: user });
+  } catch (err) {
+    console.error('[updateUserProfile]', err.message);
+    return sendError(res, 500, 'Server error during profile update.');
+  }
+};
+
 // ─── GET /api/users/:id (Protected: Admin or Self Only) ─────────────────────────
 const getUserById = async (req, res) => {
   try {
@@ -166,6 +200,7 @@ const deleteUser = async (req, res) => {
 module.exports = {
   getUsers,
   updateUserRole,
+  updateUserProfile,
   getUserById,
   deleteUser,
 };

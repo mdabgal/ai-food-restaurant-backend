@@ -1,10 +1,65 @@
 'use strict';
 
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 const { ObjectId } = require('mongodb');
 const { getDB } = require('../config/db');
 const { signToken, attachCookie, clearCookie } = require('../utils/jwt.utils');
 const { sendSuccess, sendError } = require('../utils/response.utils');
+const {
+  GoogleOAuthConfigurationError,
+  createGoogleAuthorizationUrl,
+  exchangeGoogleAuthorizationCode,
+} = require('../services/googleOAuthService');
+
+const GOOGLE_STATE_COOKIE = 'google_oauth_state';
+const GOOGLE_STATE_COOKIE_OPTIONS = {
+  httpOnly: true,
+  secure: process.env.NODE_ENV === 'production',
+  sameSite: 'lax',
+  maxAge: 10 * 60 * 1000,
+  path: '/api/auth/google',
+};
+
+const getClientUrl = () => process.env.CLIENT_URL?.trim() || 'http://localhost:3000';
+
+const redirectGoogleResult = (res, params) => {
+  const target = new URL('/auth/google/callback', getClientUrl());
+  Object.entries(params).forEach(([key, value]) => target.searchParams.set(key, value));
+  return res.redirect(target.toString());
+};
+
+const clearGoogleStateCookie = (res) => {
+  res.clearCookie(GOOGLE_STATE_COOKIE, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax',
+    path: '/api/auth/google',
+  });
+};
+
+const stateMatches = (expected, received) => {
+  if (!expected || !received) return false;
+  const expectedBuffer = Buffer.from(expected);
+  const receivedBuffer = Buffer.from(received);
+  return expectedBuffer.length === receivedBuffer.length
+    && crypto.timingSafeEqual(expectedBuffer, receivedBuffer);
+};
+
+const completeLogin = (res, user, message) => {
+  const token = signToken({
+    id: user._id,
+    email: user.email,
+    role: user.role,
+  });
+  attachCookie(res, token);
+
+  const { password: _, ...userWithoutPassword } = user;
+  return sendSuccess(res, 200, message, {
+    token,
+    user: userWithoutPassword,
+  });
+};
 
 // ─── POST /api/auth/register ──────────────────────────────────────────────────
 /**
@@ -116,7 +171,8 @@ const login = async (req, res) => {
     }
 
     // ── Verify password ────────────────────────────────────────────────────────
-    const isMatch = await bcrypt.compare(password, user.password);
+    const isMatch = typeof user.password === 'string'
+      && await bcrypt.compare(password, user.password);
     if (!isMatch) {
       return sendError(res, 401, 'Invalid email or password.');
     }
@@ -152,9 +208,134 @@ const login = async (req, res) => {
  * No body required.
  * Success (200): Cookie cleared.
  */
+const demoLogin = async (req, res) => {
+  try {
+    if (process.env.DEMO_LOGIN_ENABLED !== 'true') {
+      return sendError(res, 503, 'Demo login is currently unavailable.');
+    }
+
+    const { role } = req.body;
+    if (!['user', 'admin'].includes(role)) {
+      return sendError(res, 400, 'Demo role must be either user or admin.');
+    }
+
+    const prefix = role === 'admin' ? 'DEMO_ADMIN' : 'DEMO_USER';
+    const email = process.env[`${prefix}_EMAIL`];
+    const password = process.env[`${prefix}_PASSWORD`];
+    if (!email || !password) {
+      return sendError(res, 503, 'Demo login is not configured.');
+    }
+
+    const user = await getDB().collection('users').findOne({
+      email: email.trim().toLowerCase(),
+    });
+    const passwordMatches = user && await bcrypt.compare(password, user.password);
+    if (!passwordMatches || user.role !== role) {
+      return sendError(res, 503, 'Demo account is not available.');
+    }
+
+    const label = role === 'admin' ? 'Demo admin' : 'Demo user';
+    return completeLogin(res, user, `${label} logged in successfully.`);
+  } catch (err) {
+    console.error('[demoLogin]', err.message);
+    return sendError(res, 500, 'Server error during demo login.');
+  }
+};
+
+const startGoogleAuth = (req, res) => {
+  try {
+    const state = crypto.randomBytes(32).toString('hex');
+    const authorizationUrl = createGoogleAuthorizationUrl(state);
+    res.cookie(GOOGLE_STATE_COOKIE, state, GOOGLE_STATE_COOKIE_OPTIONS);
+    return res.redirect(authorizationUrl);
+  } catch (error) {
+    if (error instanceof GoogleOAuthConfigurationError) {
+      return redirectGoogleResult(res, { error: error.code });
+    }
+    console.error('[startGoogleAuth]', error.message);
+    return redirectGoogleResult(res, { error: 'GOOGLE_OAUTH_START_FAILED' });
+  }
+};
+
+const googleAuthCallback = async (req, res) => {
+  const expectedState = req.cookies?.[GOOGLE_STATE_COOKIE];
+  clearGoogleStateCookie(res);
+
+  try {
+    if (req.query.error) {
+      return redirectGoogleResult(res, { error: 'GOOGLE_ACCESS_DENIED' });
+    }
+    if (!stateMatches(expectedState, req.query.state)) {
+      return redirectGoogleResult(res, { error: 'GOOGLE_INVALID_STATE' });
+    }
+    if (typeof req.query.code !== 'string' || !req.query.code) {
+      return redirectGoogleResult(res, { error: 'GOOGLE_CODE_MISSING' });
+    }
+
+    const profile = await exchangeGoogleAuthorizationCode(req.query.code);
+    const googleId = profile?.sub?.trim();
+    const email = profile?.email?.trim().toLowerCase();
+
+    if (!googleId || !email || profile.email_verified !== true) {
+      return redirectGoogleResult(res, { error: 'GOOGLE_PROFILE_INVALID' });
+    }
+
+    const users = getDB().collection('users');
+    let user = await users.findOne({ googleId });
+    if (!user) user = await users.findOne({ email });
+
+    if (user) {
+      const update = {
+        googleId,
+        emailVerified: true,
+        updatedAt: new Date(),
+      };
+      if (!user.name && profile.name) update.name = profile.name.trim();
+      if (!user.image && profile.picture) update.image = profile.picture;
+
+      await users.updateOne(
+        { _id: user._id },
+        {
+          $set: update,
+          $addToSet: { authProviders: 'google' },
+        }
+      );
+      user = await users.findOne({ _id: user._id });
+    } else {
+      const newUser = {
+        name: profile.name?.trim() || email.split('@')[0],
+        email,
+        image: profile.picture || null,
+        googleId,
+        emailVerified: true,
+        authProviders: ['google'],
+        role: 'user',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+      const insertResult = await users.insertOne(newUser);
+      user = { _id: insertResult.insertedId, ...newUser };
+    }
+
+    const token = signToken({ id: user._id, email: user.email, role: user.role });
+    attachCookie(res, token);
+    return redirectGoogleResult(res, { success: 'true' });
+  } catch (error) {
+    if (error instanceof GoogleOAuthConfigurationError) {
+      return redirectGoogleResult(res, { error: error.code });
+    }
+    if (error?.code === 11000) {
+      return redirectGoogleResult(res, { error: 'GOOGLE_ACCOUNT_CONFLICT' });
+    }
+    console.error('[googleAuthCallback]', error.message);
+    return redirectGoogleResult(res, { error: 'GOOGLE_AUTH_FAILED' });
+  }
+};
+
 const logout = async (req, res) => {
   try {
     clearCookie(res);
+    clearGoogleStateCookie(res);
     return res.status(200).json({
       success: true,
       message: 'Logged out successfully'
@@ -206,4 +387,12 @@ const getMe = async (req, res) => {
   }
 };
 
-module.exports = { register, login, logout, getMe };
+module.exports = {
+  register,
+  login,
+  demoLogin,
+  startGoogleAuth,
+  googleAuthCallback,
+  logout,
+  getMe,
+};
